@@ -8,6 +8,7 @@ class OllamaHandler:
     def __init__(self, base_url="http://localhost:11434", model="deepseek-ocr"):
         self.base_url = base_url
         self.model = model
+        self.session = requests.Session()
 
     def check_connection(self):
         """
@@ -16,7 +17,7 @@ class OllamaHandler:
             tuple: (bool, str) -> (Success, Message or Model Name)
         """
         try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=2)
+            response = self.session.get(f"{self.base_url}/api/tags", timeout=2)
             if response.status_code == 200:
                 models = response.json().get('models', [])
                 found_model = None
@@ -41,132 +42,120 @@ class OllamaHandler:
         except Exception as e:
             return False, str(e)
 
-    def perform_ocr(self, image: Image.Image):
+    def perform_ocr(self, image: Image.Image, prompt="<|grounding|>Extract text with bounding boxes.", timeout=120):
         """
-        Sends the image to Ollama for OCR.
+        Sends the image to Ollama for OCR using the CLI.
+        The CLI (ollama run) is 100% reliable for DeepSeek-OCR.
+        Maintains native resolution (no resizing) to match user manual test.
         """
-        # Debug: Save image for verification
+        import subprocess
+        import os
+        import tempfile
+
+        # 1. Color Mode & Quality Protection
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+            
+        # 2. Save image to a temporary file
+        temp_dir = tempfile.gettempdir()
+        temp_img_path = os.path.join(temp_dir, f"ocr_input_{os.getpid()}.jpg")
         try:
-            image.save("ocr_debug_input.jpg", format="JPEG")
-        except:
-            pass
-
-        # Convert image to base64
-        buffered = io.BytesIO()
-        image.save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-        prompt = "<|grounding|>Extract text with bounding boxes."
-        
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "images": [img_str],
-            "stream": False,
-            "options": {
-                "num_ctx": 8192, # Increase context window
-                "num_predict": -1 # Unlimited generation
-            }
-        }
-
-        try:
-            response = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
-            if response.status_code == 200:
-                return response.json().get('response', '')
-            else:
-                print(f"Error: {response.text}")
-                return ""
+            # Use quality=100 to avoid any compression artifacts
+            image.save(temp_img_path, format="JPEG", quality=100, subsampling=0)
+            # Also save to current dir for debug
+            image.save("ocr_debug_input.jpg", format="JPEG", quality=100, subsampling=0)
         except Exception as e:
-            print(f"Exception during OCR: {e}")
-            return ""
+            print(f"Failed to save temporary image: {e}")
+            raise e
+
+        # 2. Prepare the CLI command
+        # Using shell=True and a single string mimics a manual terminal run,
+        # which avoids the ~1250 character truncation issue.
+        # Ensure path and prompt are correctly formatted for the shell.
+        safe_path = temp_img_path.replace("\\", "\\\\")
+        cmd_str = f'ollama run {self.model} "{safe_path}\\n{prompt}"'
+        
+        print(f"[OCR Request CLI] Model: {self.model} | Image: {image.width}x{image.height} (Shell-wrapped)")
+        
+        try:
+            # We use shell=True to replicate the user's manual success
+            res = subprocess.run(
+                cmd_str,
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout
+            )
+            
+            if res.returncode == 0:
+                # The CLI output might include "Added image..." at the top
+                # but parse_response regex will handle it.
+                response_text = res.stdout.strip()
+                
+                # Debug logging
+                try:
+                    with open("ocr_debug_log.txt", "w", encoding="utf-8") as f:
+                        f.write(response_text)
+                except:
+                    pass
+                    
+                return response_text
+            else:
+                error_msg = f"Ollama CLI error (code {res.returncode}): {res.stderr}"
+                print(error_msg)
+                raise Exception(error_msg)
+                
+        except subprocess.TimeoutExpired:
+            raise Exception(f"OCR Timed out after {timeout}s")
+        except Exception as e:
+            print(f"Exception during OCR CLI: {e}")
+            raise e
+        finally:
+            if os.path.exists(temp_img_path):
+                try:
+                    os.remove(temp_img_path)
+                except:
+                    pass
 
     def parse_response(self, text):
         """
         Parses the DeepSeek-OCR output format:
         <|ref|>text<|/ref|><|det|>[[ymin, xmin, ymax, xmax]]<|/det|>\n(content)
-        
-        Returns:
-            list of dict: [{'bbox': [x, y, w, h], 'text': 'content'}]
-            Note: bbox is normalized (0.0-1.0) and converted to [x, y, w, h] or similar for easier usage.
-            Actually, let's return [xmin, ymin, xmax, ymax] normalized.
         """
+        if isinstance(text, list): return text
         results = []
         
-        # Regex to capture the block. 
-        # Structure: <|ref|>(type)<|/ref|><|det|>\[\[(coords)\]\]<|/det|>\n(content...)
-        # Content might span multiple lines until the next tag or end of string? 
-        # The prompt says "Tag block immediately followed by text... until empty line".
-        # Let's try splitting by the specific tag pattern.
-        
-        # Pattern to find the start of a block
-        # Updated to be robust against whitespace between tags
-        # <|ref|> type <|/ref|> <|det|> [[ coords ]] <|/det|>
+        # Robust pattern to handle various whitespace/tag variations
         pattern = re.compile(r'<\|ref\|>\s*(?P<type>.*?)\s*<\|/ref\|>\s*<\|det\|>\s*\[\[(?P<coords>.*?)\]\]\s*<\|/det\|>')
         
-        # Debug: Log raw response to file for analysis
-        try:
-            with open("ocr_debug_log.txt", "a", encoding="utf-8") as f:
-                f.write("-" * 40 + "\n")
-                f.write(text + "\n")
-        except:
-            pass
-        
-        # We iterate over matches
         matches = list(pattern.finditer(text))
         
         for i, match in enumerate(matches):
-            type_str = match.group('type')
-            
-            # Filter only text - DISABLED based on user feedback
-            # DeepSeek-OCR uses various tags like 'title', 'sub_title', 'text', 'table', 'figure_text'
-            # We want to capture text from all of them.
-            # if type_str != 'text':
-            #    continue
-                
-            coords_str = match.group('coords')
             try:
-                # coords are valid python list string "ymin, xmin, ymax, xmax"
-                # e.g. "100, 200, 300, 400"
+                coords_str = match.group('coords')
                 coords = [float(x.strip()) for x in coords_str.split(',')]
+                if len(coords) != 4: continue
+                
+                # Parse Content
+                start_index = match.end()
+                if i + 1 < len(matches):
+                    end_index = matches[i+1].start()
+                else:
+                    end_index = len(text)
+                    
+                content = text[start_index:end_index].strip()
+                
+                # DeepSeek-OCR (this version) uses [xmin, ymin, xmax, ymax]
+                # as verified by horizontal text spanning (1st/3rd numbers are X).
+                xmin, ymin, xmax, ymax = coords
+                
+                results.append({
+                    'bbox': [xmin / 1000.0, ymin / 1000.0, xmax / 1000.0, ymax / 1000.0],
+                    'text': content
+                })
             except:
                 continue
-                
-            if len(coords) != 4:
-                continue
-                
-            # Parse Content
-            # Content starts after the end of this match
-            start_index = match.end()
-            
-            # Content ends at the start of the next match, or end of string
-            if i + 1 < len(matches):
-                end_index = matches[i+1].start()
-            else:
-                end_index = len(text)
-                
-            raw_content = text[start_index:end_index]
-            
-            # The prompt says: "Tag block immediately followed by text... until empty line"
-            # But usually the model outputs: [Tag]\nContent\n
-            # Let's strip whitespace and take the content.
-            # If there are multiple lines, we preserve them?
-            # Usually OCR result is line-based. 
-            # Let's strip leading newline if present.
-            
-            content = raw_content.strip()
-            
-            # Normalize coordinates (0-1000) -> (0.0-1.0)
-            # Input: [xmin, ymin, xmax, ymax] relative to 1000
-            xmin, ymin, xmax, ymax = coords
-            
-            norm_ymin = ymin / 1000.0
-            norm_xmin = xmin / 1000.0
-            norm_ymax = ymax / 1000.0
-            norm_xmax = xmax / 1000.0
-            
-            results.append({
-                'bbox': [norm_xmin, norm_ymin, norm_xmax, norm_ymax], # Standard x1, y1, x2, y2
-                'text': content
-            })
             
         return results
