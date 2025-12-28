@@ -162,12 +162,8 @@ class PDFProcessor:
                     pass
                 
                 text_obj = c.beginText()
-                # Debug: Visible text (0) instead of Invisible (3)
-                text_obj.setTextRenderMode(0) 
-                
-                # Debug: Red Text
-                c.setFillColor("red")
-                text_obj.setFillColor("red")
+                # PRODUCTION: Invisible text (3) for searchable PDF
+                text_obj.setTextRenderMode(3) 
                 
                 if not ocr_data and ocr_text_raw.strip():
                     # --- Special handling for coordinate-less text ---
@@ -201,9 +197,9 @@ class PDFProcessor:
                         box_width = (xmax - xmin) * img_width
                         box_height = (ymax - ymin) * img_height
                         
-                        # Debug: Draw Blue Rectangle
-                        c.setStrokeColor("blue")
-                        c.rect(x_pos, y_pos, box_width, box_height, fill=0)
+                        # Debug: Draw Blue Rectangle (Disabled for Production)
+                        # c.setStrokeColor("blue")
+                        # c.rect(x_pos, y_pos, box_width, box_height, fill=0)
                     
                         # --- New Smart Text Sizing & Wrapping ---
                         # Using reportlab's simpleSplit for accurate width calculation
