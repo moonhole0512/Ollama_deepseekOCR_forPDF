@@ -57,6 +57,10 @@ class PDFProcessor:
             
             output_path = os.path.splitext(input_path)[0] + "_ocr.pdf"
             
+            # Error tracking
+            primary_failed_pages = []
+            completely_failed_pages = []
+            
             # Create ReportLab Canvas
             c = canvas.Canvas(output_path)
             
@@ -117,30 +121,9 @@ class PDFProcessor:
                     # Attempt 1: Grounding OCR (90s timeout)
                     ocr_text_raw = self.ollama_handler.perform_ocr(img, timeout=90, page_num=display_num)
                     ocr_data = self.ollama_handler.parse_response(ocr_text_raw)
-                except HallucinationError:
-                    is_fallback = True
-                    halt_msg = f"[Page {display_num}] Hallucination Detected! Canceling pass and cleaning up..."
-                    if progress_callback:
-                        progress_callback(display_num, total_pages, halt_msg)
-                    print(halt_msg)
-                    
-                    # More generous wait for GPU to clear after hallucination
-                    import time
-                    time.sleep(3)
-                    
-                    try:
-                        # Attempt 2: Free OCR Fallback (120s timeout) - Use Native Resolution
-                        print(f"[Page {display_num}] Starting clean Fallback pass (Free OCR)...")
-                        ocr_text_raw = self.ollama_handler.perform_ocr(img, prompt="Free OCR.", timeout=120, page_num=display_num)
-                        ocr_data = self.ollama_handler.parse_response(ocr_text_raw)
-                    except Exception as e_inner:
-                        final_error_msg = f"!!! [Page {display_num}] CRITICAL: Fallback pass also failed !!! Reason: {e_inner}"
-                        if progress_callback:
-                            progress_callback(display_num, total_pages, final_error_msg)
-                        print(final_error_msg)
-                        pass
                 except Exception as e:
-                    # Timeout or other error occurred with Grounding OCR
+                    # Primary OCR failed (includes HallucinationError or Timeout)
+                    primary_failed_pages.append(display_num)
                     is_fallback = True
                     primary_error = f"[Page {display_num}] Primary OCR Failed: {e}"
                     if progress_callback:
@@ -148,17 +131,16 @@ class PDFProcessor:
                     print(primary_error)
                     
                     print(f"[Page {display_num}] Waiting for GPU recovery before fallback...")
-                    
-                    # Wait a bit for Ollama to recover
                     import time
                     time.sleep(3)
                     
                     try:
-                        # Attempt 2: Free OCR Fallback (120s timeout) - Use Native Resolution
+                        # Attempt 2: Free OCR Fallback (120s timeout)
                         print(f"[Page {display_num}] Starting Fallback pass (Free OCR)...")
                         ocr_text_raw = self.ollama_handler.perform_ocr(img, prompt="Free OCR.", timeout=120, page_num=display_num)
                         ocr_data = self.ollama_handler.parse_response(ocr_text_raw)
                     except Exception as e_inner:
+                        completely_failed_pages.append(display_num)
                         final_error_msg = f"!!! [Page {display_num}] CRITICAL: Both OCR passes failed !!! Reason: {e_inner}"
                         if progress_callback:
                             progress_callback(display_num, total_pages, final_error_msg)
@@ -284,6 +266,23 @@ class PDFProcessor:
             
             c.save()
             doc.close()
+
+            # --- Summary Report in CMD ---
+            print("\n" + "="*50)
+            print(f"OCR PROCESSING SUMMARY: {os.path.basename(input_path)}")
+            print(f"Total Pages: {total_pages}")
+            
+            if primary_failed_pages:
+                print(f"WARNING: Primary OCR Failed on {len(primary_failed_pages)} pages: {primary_failed_pages}")
+                print("         (These pages were processed using 'Free OCR' fallback)")
+            
+            if completely_failed_pages:
+                print(f"CRITICAL: Complete Failure on {len(completely_failed_pages)} pages: {completely_failed_pages}")
+                print("          (No text extracted for these pages)")
+            else:
+                print("All pages had some text extracted successfully.")
+            print("="*50 + "\n")
+
             return True, output_path
             
         except Exception as e:
