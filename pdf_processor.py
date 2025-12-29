@@ -9,6 +9,7 @@ import math
 import textwrap
 import io
 from PIL import Image
+from ocr_engine import HallucinationError
 
 # Font Registration attempt
 # Common paths for Korean fonts on Windows
@@ -86,10 +87,11 @@ class PDFProcessor:
                     # Only use extracted image if it's large enough to be a page (e.g. > 1000px height)
                     if best_img and best_img.height > 1000:
                         img = best_img
-                        print(f"[PDF] Extracted native image: {img.width}x{img.height}")
+                        print(f"[PDF][Page {display_num}] Extracted native image: {img.width}x{img.height}")
                 
                 if img is None:
                     # Fallback: Render at high-fidelity DPI (300)
+                    print(f"[PDF][Page {display_num}] No native image found. Rendering at 300 DPI...")
                     zoom = 300 / 72 
                     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -112,44 +114,56 @@ class PDFProcessor:
                 ocr_text_raw = ""
                 
                 try:
-                    # Attempt 1: Grounding OCR (60s timeout)
-                    ocr_text_raw = self.ollama_handler.perform_ocr(img, timeout=60)
+                    # Attempt 1: Grounding OCR (90s timeout)
+                    ocr_text_raw = self.ollama_handler.perform_ocr(img, timeout=90, page_num=display_num)
                     ocr_data = self.ollama_handler.parse_response(ocr_text_raw)
-                except Exception as e:
-                    # Timeout or error occurred with Grounding OCR
+                except HallucinationError:
                     is_fallback = True
-                    fallback_msg = f"Timeout/Error on page {display_num}. Switching to Free OCR fallback..."
+                    halt_msg = f"[Page {display_num}] Hallucination Detected! Canceling pass and cleaning up..."
                     if progress_callback:
-                        progress_callback(display_num, total_pages, fallback_msg)
-                    print(fallback_msg)
+                        progress_callback(display_num, total_pages, halt_msg)
+                    print(halt_msg)
+                    
+                    # More generous wait for GPU to clear after hallucination
+                    import time
+                    time.sleep(3)
+                    
+                    try:
+                        # Attempt 2: Free OCR Fallback (120s timeout) - Use Native Resolution
+                        print(f"[Page {display_num}] Starting clean Fallback pass (Free OCR)...")
+                        ocr_text_raw = self.ollama_handler.perform_ocr(img, prompt="Free OCR.", timeout=120, page_num=display_num)
+                        ocr_data = self.ollama_handler.parse_response(ocr_text_raw)
+                    except Exception as e_inner:
+                        final_error_msg = f"!!! [Page {display_num}] CRITICAL: Fallback pass also failed !!! Reason: {e_inner}"
+                        if progress_callback:
+                            progress_callback(display_num, total_pages, final_error_msg)
+                        print(final_error_msg)
+                        pass
+                except Exception as e:
+                    # Timeout or other error occurred with Grounding OCR
+                    is_fallback = True
+                    primary_error = f"[Page {display_num}] Primary OCR Failed: {e}"
+                    if progress_callback:
+                        progress_callback(display_num, total_pages, primary_error)
+                    print(primary_error)
+                    
+                    print(f"[Page {display_num}] Waiting for GPU recovery before fallback...")
                     
                     # Wait a bit for Ollama to recover
                     import time
-                    time.sleep(2)
+                    time.sleep(3)
                     
                     try:
-                        # Attempt 2: Free OCR Fallback (60s timeout)
-                        # Optimize image for fallback (faster processing)
-                        max_dim = 1600
-                        if img.width > max_dim or img.height > max_dim:
-                            scale = max_dim / max(img.width, img.height)
-                            fb_img = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS)
-                            print(f"Resized fallback image to {fb_img.width}x{fb_img.height}")
-                        else:
-                            fb_img = img
-
-                        # The user requested "Free OCR." prompt
-                        ocr_text_raw = self.ollama_handler.perform_ocr(fb_img, prompt="Free OCR.", timeout=60)
-                        # parse_response will likely return empty list if tags are missing
+                        # Attempt 2: Free OCR Fallback (120s timeout) - Use Native Resolution
+                        print(f"[Page {display_num}] Starting Fallback pass (Free OCR)...")
+                        ocr_text_raw = self.ollama_handler.perform_ocr(img, prompt="Free OCR.", timeout=120, page_num=display_num)
                         ocr_data = self.ollama_handler.parse_response(ocr_text_raw)
                     except Exception as e_inner:
-                        error_msg = f"Permanent failure on page {display_num}: {e_inner}"
-                        print(error_msg)
-                        # The user says skipping is not an option ("안되 다음페이지로 넘어가면 내 목적과 달라져")
-                        # So we might have to raise or try one more time? 
-                        # But 60s is requested. If it keeps failing, it might be a model/server issue.
-                        # For now, let's raise to let the user see the persistent error.
-                        raise e_inner
+                        final_error_msg = f"!!! [Page {display_num}] CRITICAL: Both OCR passes failed !!! Reason: {e_inner}"
+                        if progress_callback:
+                            progress_callback(display_num, total_pages, final_error_msg)
+                        print(final_error_msg)
+                        pass
 
                 # 3. Draw Debug Text & Boxes
                 # If ocr_data is empty but we have raw text, it might be Free OCR output without tags

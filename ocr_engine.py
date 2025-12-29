@@ -2,7 +2,13 @@ import re
 import requests
 import base64
 import io
+import json
+import time
 from PIL import Image
+
+class HallucinationError(Exception):
+    """Raised when the model output is detected as a repetitive hallucination loop."""
+    pass
 
 class OllamaHandler:
     def __init__(self, base_url="http://localhost:11434", model="deepseek-ocr"):
@@ -42,82 +48,121 @@ class OllamaHandler:
         except Exception as e:
             return False, str(e)
 
-    def perform_ocr(self, image: Image.Image, prompt="<|grounding|>Extract text with bounding boxes.", timeout=120):
+    def perform_ocr(self, image: Image.Image, prompt="<|grounding|>Extract text with bounding boxes.", timeout=120, page_num=None):
         """
-        Sends the image to Ollama for OCR using the CLI.
-        The CLI (ollama run) is 100% reliable for DeepSeek-OCR.
-        Maintains native resolution (no resizing) to match user manual test.
+        Sends the image to Ollama for OCR using the /api/generate endpoint with streaming.
+        Detects hallucinatory repetitive patterns early to avoid long waits.
         """
-        import subprocess
-        import os
-        import tempfile
-
-        # 1. Color Mode & Quality Protection
+        # 1. Color Mode Protection
         if image.mode != "RGB":
             image = image.convert("RGB")
             
-        # 2. Save image to a temporary file
-        temp_dir = tempfile.gettempdir()
-        temp_img_path = os.path.join(temp_dir, f"ocr_input_{os.getpid()}.jpg")
+        # 2. Encode image to Base64
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG", quality=100, subsampling=0)
+        img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        
         try:
-            # Use quality=100 to avoid any compression artifacts
-            image.save(temp_img_path, format="JPEG", quality=100, subsampling=0)
-            # Also save to current dir for debug
             image.save("ocr_debug_input.jpg", format="JPEG", quality=100, subsampling=0)
-        except Exception as e:
-            print(f"Failed to save temporary image: {e}")
-            raise e
+        except:
+            pass
 
-        # 2. Prepare the CLI command
-        # Using shell=True and a single string mimics a manual terminal run,
-        # which avoids the ~1250 character truncation issue.
-        # Ensure path and prompt are correctly formatted for the shell.
-        safe_path = temp_img_path.replace("\\", "\\\\")
-        cmd_str = f'ollama run {self.model} "{safe_path}\\n{prompt}"'
+        page_ctx = f" [Page {page_num}]" if page_num is not None else ""
+        print(f"[OCR Request API]{page_ctx} Model: {self.model} | Format: {image.width}x{image.height} | Timeout: {timeout}s (Streaming)")
         
-        print(f"[OCR Request CLI] Model: {self.model} | Image: {image.width}x{image.height} (Shell-wrapped)")
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "images": [img_b64],
+            "stream": True,
+            "options": {
+                "num_ctx": 8192,
+                "num_predict": 4096,
+                "temperature": 0
+            }
+        }
+        
+        full_response = []
+        hallucination_detected = False
         
         try:
-            # We use shell=True to replicate the user's manual success
-            res = subprocess.run(
-                cmd_str,
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout
+            start_time = time.time()
+            # Note: total timeout for the stream
+            response = self.session.post(
+                f"{self.base_url}/api/generate",
+                json=payload,
+                stream=True,
+                timeout=(5, 120) # Connect timeout, Time between chunks
             )
             
-            if res.returncode == 0:
-                # The CLI output might include "Added image..." at the top
-                # but parse_response regex will handle it.
-                response_text = res.stdout.strip()
-                
-                # Debug logging
-                try:
-                    with open("ocr_debug_log.txt", "w", encoding="utf-8") as f:
-                        f.write(response_text)
-                except:
-                    pass
-                    
-                return response_text
-            else:
-                error_msg = f"Ollama CLI error (code {res.returncode}): {res.stderr}"
-                print(error_msg)
+            if response.status_code != 200:
+                error_msg = f"Ollama API error (code {response.status_code}): {response.text}"
                 raise Exception(error_msg)
+
+            try:
+                # --- Hallucination Detection Buffer ---
+                # We look for long repeated patterns in the last N tokens
+                recent_buffer = ""
                 
-        except subprocess.TimeoutExpired:
+                for line in response.iter_lines():
+                    if time.time() - start_time > timeout:
+                        raise requests.exceptions.Timeout()
+                        
+                    if not line:
+                        continue
+                        
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    token = chunk.get('response', '')
+                    full_response.append(token)
+                    recent_buffer += token
+                    
+                    # Keep buffer manageable but long enough for pattern detection
+                    if len(recent_buffer) > 200:
+                        recent_buffer = recent_buffer[-200:]
+                    
+                    # Detection 1: Identical short pattern repeat (e.g. "1.1.1.1." or "abcabcabc")
+                    if len(recent_buffer) > 50:
+                        for p_len in range(1, 11):
+                            segment = recent_buffer[-p_len:]
+                            # If a character/sequence repeats more than 15 times consecutively
+                            if recent_buffer.endswith(segment * 15):
+                                hallucination_detected = True
+                                print(f"{page_ctx} !!! Early Hallucination Detected (pattern: {repr(segment)}) !!!")
+                                break
+                    
+                    if hallucination_detected:
+                        break
+                    
+                    if chunk.get('done'):
+                        break
+                
+                if hallucination_detected:
+                    raise HallucinationError("Repetitive pattern detected in model output.")
+            finally:
+                response.close() # CRITICAL: Ensure server knows we stopped reading
+                
+            response_text = "".join(full_response).strip()
+            
+            # Final debug log
+            try:
+                with open("ocr_debug_log.txt", "w", encoding="utf-8") as f:
+                    f.write(response_text)
+            except:
+                pass
+                
+            return response_text
+                
+        except (requests.exceptions.Timeout, requests.exceptions.ReadTimeout):
             raise Exception(f"OCR Timed out after {timeout}s")
+        except HallucinationError:
+            raise
         except Exception as e:
-            print(f"Exception during OCR CLI: {e}")
+            print(f"{page_ctx} Exception during OCR API: {e}")
             raise e
-        finally:
-            if os.path.exists(temp_img_path):
-                try:
-                    os.remove(temp_img_path)
-                except:
-                    pass
 
     def parse_response(self, text):
         """
